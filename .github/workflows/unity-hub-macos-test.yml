@@ -1,89 +1,54 @@
-name: unity-hub-macos-signature-check
+name: macos-codesign-check
 on: workflow_dispatch
 
 jobs:
   test:
-    runs-on: macos-13
-    timeout-minutes: 15
+    runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - name: System info
-        timeout-minutes: 1
         run: |
           sw_vers
-          uname -a
+          uname -m
 
-      - name: Download real Unity Hub (arm64)
-        timeout-minutes: 3
+      - name: Write validator (same logic as editorUtils_darwin validateEditorFile, default path)
         run: |
-          set -x
-          curl -L --max-time 150 -o UnityHubSetup-arm64.dmg "https://public-cdn.cloud.unity3d.com/hub/prod/UnityHubSetup-arm64.dmg"
-          ls -la UnityHubSetup-arm64.dmg
-          shasum -a 256 UnityHubSetup-arm64.dmg
-
-      - name: Mount DMG and install Hub
-        timeout-minutes: 3
-        run: |
-          set -x
-          hdiutil attach UnityHubSetup-arm64.dmg -nobrowse -mountpoint /Volumes/UnityHub
-          ls -la /Volumes/UnityHub
-          cp -R "/Volumes/UnityHub/Unity Hub.app" /Applications/
-          hdiutil detach /Volumes/UnityHub
-          codesign -dv --verbose=4 "/Applications/Unity Hub.app" 2>&1 || true
-
-      - name: Locate app.asar
-        timeout-minutes: 2
-        run: |
-          set -x
-          find "/Applications/Unity Hub.app" -name "app.asar" -print
-          find "/Applications/Unity Hub.app" -iname "*editorUtils*" -print
-
-      - name: Extract asar via npx (no global install)
-        timeout-minutes: 4
-        run: |
-          set -x
-          ASAR_PATH=$(find "/Applications/Unity Hub.app" -name "app.asar" | head -1)
-          echo "ASAR_PATH=$ASAR_PATH"
-          mkdir -p extracted_asar
-          npx --yes @electron/asar extract "$ASAR_PATH" extracted_asar
-
-      - name: Search for signature/verification logic
-        timeout-minutes: 2
-        run: |
-          set -x
-          echo "---- files matching editor/verify/signature ----"
-          grep -rli "codesign\|verifySignature\|CompanyName\|signature" extracted_asar --include=*.js | head -50 || true
-
-      - name: Dump candidate verification files
-        timeout-minutes: 2
-        run: |
-          set -x
-          for f in $(grep -rli "codesign\|verifySignature\|signature" extracted_asar --include=*.js 2>/dev/null | grep -i "editor\|verif\|signatur" | head -10); do
-            echo "===== $f ====="
-            cat "$f"
-            echo
-          done
-
-      - name: Upload extracted source as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: extracted-hub-source
-          path: extracted_asar
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Build a trivially forged unsigned "Unity Editor" and test Gatekeeper
-        timeout-minutes: 2
-        run: |
-          set -x
-          mkdir -p ForgedEditor.app/Contents/MacOS
-          cat > ForgedEditor.app/Contents/MacOS/Unity << 'EOF'
-          #!/bin/bash
-          echo "THIS IS A FORGED, UNSIGNED BINARY PRETENDING TO BE THE UNITY EDITOR"
-          echo "argv: $@"
+          cat > "$RUNNER_TEMP/hubcheck.js" << 'EOF'
+          const { execFile } = require('child_process');
+          const util = require('util');
+          const ef = util.promisify(execFile);
+          (async () => {
+            const editorPath = process.argv[2];
+            let fields = [];
+            try {
+              const { stderr } = await ef('/usr/bin/codesign', ['-dvvv', editorPath]);
+              fields = stderr.split('\n');
+            } catch (e) {
+              console.log('HUB VERDICT: REJECT (ERROR.FAILED_LICENSE_INFO)');
+              return;
+            }
+            let executable = '', identifier = '', developer = '';
+            for (const line of fields) if (line.startsWith('Executable')) executable = line;
+            else if (line.startsWith('Identifier')) identifier = line;
+            else if (line.startsWith('Authority=Developer ID Application:')) developer = line;
+            if (!executable.includes(`${editorPath}/Contents/MacOS/Unity`) || !identifier.includes('com.unity3d.UnityEditor')) console.log('HUB VERDICT: REJECT (ERROR.NOT_AN_UNITY_APP)');
+            else if (fields.length === 2 || !developer.includes('Unity Technologies')) console.log('HUB VERDICT: REJECT (ERROR.NOT_SIGNED)');
+            else console.log('HUB VERDICT: ACCEPT (validateEditorFile returns true)');
+          })();
           EOF
-          chmod +x ForgedEditor.app/Contents/MacOS/Unity
-          cat > ForgedEditor.app/Contents/Info.plist << 'EOF'
+
+      - name: Build three test bundles
+        run: |
+          set -x
+          cd "$RUNNER_TEMP"
+          cat > u.c << 'EOF'
+          #include <stdio.h>
+          int main(void){ puts("FORGED EDITOR EXECUTED - not built or signed by Unity"); return 0; }
+          EOF
+          for c in caseA_unsigned caseB_adhoc caseC_selfsigned; do
+            mkdir -p "$c/Unity.app/Contents/MacOS"
+            clang -o "$c/Unity.app/Contents/MacOS/Unity" u.c
+            cat > "$c/Unity.app/Contents/Info.plist" << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -91,9 +56,70 @@ jobs:
             <key>CFBundleExecutable</key><string>Unity</string>
             <key>CFBundleIdentifier</key><string>com.unity3d.UnityEditor5.x</string>
             <key>CFBundleName</key><string>Unity</string>
-            <key>CFBundleShortVersionString</key><string>2022.3.50f1</string>
+            <key>CFBundleVersion</key><string>2022.3.50f1</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
           </dict>
           </plist>
           EOF
-          codesign -dv --verbose=4 ForgedEditor.app 2>&1 || echo "CONFIRMED: forged .app is UNSIGNED (no Developer ID), exactly like the Windows forged .exe in the original report"
-          spctl --assess --type execute ForgedEditor.app 2>&1 || echo "CONFIRMED: Gatekeeper REJECTS the unsigned forged app by default"
+          done
+          codesign --remove-signature caseA_unsigned/Unity.app/Contents/MacOS/Unity || true
+          codesign --force -s - --identifier com.unity3d.UnityEditor5.x caseB_adhoc/Unity.app
+
+      - name: Create self-signed certificate with a Unity-like name and sign case C
+        run: |
+          set -x
+          cd "$RUNNER_TEMP"
+          cat > cert.cnf << 'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = v3
+          prompt = no
+          [dn]
+          CN = Developer ID Application: Unity Technologies ApS (SELFSIGNED)
+          [v3]
+          basicConstraints = critical,CA:false
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = critical,codeSigning
+          EOF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -days 2 -config cert.cnf
+          /usr/bin/openssl pkcs12 -export -inkey k.pem -in c.pem -out id.p12 -passout pass:pw
+          security create-keychain -p pw forge.keychain
+          security set-keychain-settings forge.keychain
+          security unlock-keychain -p pw forge.keychain
+          security list-keychains -d user -s forge.keychain $(security list-keychains -d user | tr -d '"')
+          security import id.p12 -k forge.keychain -P pw -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k pw forge.keychain > /dev/null
+          security find-identity forge.keychain
+          HASH=$(security find-identity forge.keychain | grep -m1 -oE '[0-9A-F]{40}')
+          codesign --force -s "$HASH" --keychain forge.keychain --identifier com.unity3d.UnityEditor5.x caseC_selfsigned/Unity.app
+
+      - name: Results
+        run: |
+          cd "$RUNNER_TEMP"
+          for c in caseA_unsigned caseB_adhoc caseC_selfsigned; do
+            APP="$RUNNER_TEMP/$c/Unity.app"
+            echo "=================== $c ==================="
+            echo "--- codesign -dvvv (what Hub parses) ---"
+            codesign -dvvv "$APP" 2>&1 || true
+            echo "--- codesign --verify --deep --strict (real verification, Hub does not run this) ---"
+            codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 || echo "verify exit=$?"
+            echo "--- spctl --assess (Gatekeeper) ---"
+            spctl --assess --type execute -vv "$APP" 2>&1 || echo "spctl exit=$?"
+            echo "--- Hub validateEditorFile logic ---"
+            node "$RUNNER_TEMP/hubcheck.js" "$APP"
+            echo "--- running the binary ---"
+            "$APP/Contents/MacOS/Unity" || echo "exec exit=$?"
+          done
+
+      - name: Show the shipped Hub validator for comparison
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -L --max-time 240 -o hub.dmg "https://public-cdn.cloud.unity3d.com/hub/prod/UnityHubSetup-arm64.dmg"
+          shasum -a 256 hub.dmg
+          hdiutil attach hub.dmg -nobrowse -mountpoint "$RUNNER_TEMP/hubmnt"
+          npx --yes @electron/asar extract "$RUNNER_TEMP/hubmnt/Unity Hub.app/Contents/Resources/app.asar" asar_out
+          F=$(ls asar_out/.vite/build/editorUtils_darwin-*.js)
+          echo "FILE: $F"
+          grep -n "validateEditorFile" -A 40 "$F" | head -60
