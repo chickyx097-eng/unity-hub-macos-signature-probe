@@ -4,57 +4,78 @@ on: workflow_dispatch
 jobs:
   test:
     runs-on: macos-13
+    timeout-minutes: 15
     steps:
       - name: System info
+        timeout-minutes: 1
         run: |
           sw_vers
           uname -a
 
       - name: Download real Unity Hub (arm64)
+        timeout-minutes: 3
         run: |
-          curl -L -o UnityHubSetup-arm64.dmg "https://public-cdn.cloud.unity3d.com/hub/prod/UnityHubSetup-arm64.dmg"
+          set -x
+          curl -L --max-time 150 -o UnityHubSetup-arm64.dmg "https://public-cdn.cloud.unity3d.com/hub/prod/UnityHubSetup-arm64.dmg"
           ls -la UnityHubSetup-arm64.dmg
           shasum -a 256 UnityHubSetup-arm64.dmg
 
       - name: Mount DMG and install Hub
+        timeout-minutes: 3
         run: |
+          set -x
           hdiutil attach UnityHubSetup-arm64.dmg -nobrowse -mountpoint /Volumes/UnityHub
           ls -la /Volumes/UnityHub
           cp -R "/Volumes/UnityHub/Unity Hub.app" /Applications/
           hdiutil detach /Volumes/UnityHub
-          codesign -dv --verbose=4 "/Applications/Unity Hub.app" || true
+          codesign -dv --verbose=4 "/Applications/Unity Hub.app" 2>&1 || true
 
-      - name: Locate app.asar and relevant editorUtils source
+      - name: Locate app.asar
+        timeout-minutes: 2
         run: |
-          find "/Applications/Unity Hub.app" -name "app.asar" -o -iname "*editorUtils*"
-          npm install -g @electron/asar 2>&1 | tail -5 || npm install -g asar 2>&1 | tail -5
+          set -x
+          find "/Applications/Unity Hub.app" -name "app.asar" -print
+          find "/Applications/Unity Hub.app" -iname "*editorUtils*" -print
 
-      - name: Extract asar
+      - name: Extract asar via npx (no global install)
+        timeout-minutes: 4
         run: |
+          set -x
           ASAR_PATH=$(find "/Applications/Unity Hub.app" -name "app.asar" | head -1)
           echo "ASAR_PATH=$ASAR_PATH"
           mkdir -p extracted_asar
-          npx @electron/asar extract "$ASAR_PATH" extracted_asar || npx asar extract "$ASAR_PATH" extracted_asar
-          echo "---- searching for editor signature/verification logic ----"
-          grep -rli "codesign\|verifySignature\|CompanyName\|signature" extracted_asar --include=*.js | head -50
+          npx --yes @electron/asar extract "$ASAR_PATH" extracted_asar
+
+      - name: Search for signature/verification logic
+        timeout-minutes: 2
+        run: |
+          set -x
+          echo "---- files matching editor/verify/signature ----"
+          grep -rli "codesign\|verifySignature\|CompanyName\|signature" extracted_asar --include=*.js | head -50 || true
 
       - name: Dump candidate verification files
+        timeout-minutes: 2
         run: |
-          for f in $(grep -rli "codesign\|verifySignature\|signature" extracted_asar --include=*.js | grep -i "editor\|verif\|signatur" | head -10); do
+          set -x
+          for f in $(grep -rli "codesign\|verifySignature\|signature" extracted_asar --include=*.js 2>/dev/null | grep -i "editor\|verif\|signatur" | head -10); do
             echo "===== $f ====="
             cat "$f"
             echo
           done
 
       - name: Upload extracted source as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: extracted-hub-source
           path: extracted_asar
           retention-days: 7
+          if-no-files-found: ignore
 
-      - name: Build a trivially forged "Unity Editor" unsigned binary
+      - name: Build a trivially forged unsigned "Unity Editor" and test Gatekeeper
+        timeout-minutes: 2
         run: |
+          set -x
           mkdir -p ForgedEditor.app/Contents/MacOS
           cat > ForgedEditor.app/Contents/MacOS/Unity << 'EOF'
           #!/bin/bash
@@ -74,5 +95,5 @@ jobs:
           </dict>
           </plist>
           EOF
-          codesign -dv --verbose=4 ForgedEditor.app 2>&1 || echo "CONFIRMED: forged app.app is UNSIGNED (no Developer ID), exactly like the Windows forged .exe in the original report"
+          codesign -dv --verbose=4 ForgedEditor.app 2>&1 || echo "CONFIRMED: forged .app is UNSIGNED (no Developer ID), exactly like the Windows forged .exe in the original report"
           spctl --assess --type execute ForgedEditor.app 2>&1 || echo "CONFIRMED: Gatekeeper REJECTS the unsigned forged app by default"
